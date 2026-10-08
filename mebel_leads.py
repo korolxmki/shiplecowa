@@ -1,27 +1,32 @@
-"""Сбор телефонов мебельщиков по городу РФ из 2ГИС или Google Maps в Excel.
+"""Бесплатный сбор телефонов мебельщиков по городу РФ -> Excel.
 
-Примеры:
-    python mebel_leads.py Казань --source 2gis --key КЛЮЧ_2ГИС
-    python mebel_leads.py "Нижний Новгород" --source google --key КЛЮЧ_GOOGLE
+Источник: OpenStreetMap (без ключей и оплаты). Если у компании в OSM
+нет телефона, но есть сайт, телефон берётся со страниц сайта.
+
+Пример:
+    python mebel_leads.py Казань
+    python mebel_leads.py "Нижний Новгород" --no-sites
 """
 import argparse
 import re
 import sys
 import time
+from urllib.parse import urljoin
 
 import requests
 from openpyxl import Workbook
 
-QUERIES = [
-    "мебель на заказ",
-    "мебельная фабрика",
-    "мебельный цех",
-    "корпусная мебель",
-    "кухни на заказ",
-    "шкафы-купе на заказ",
-    "мягкая мебель производство",
-    "офисная мебель",
+OVERPASS = [
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
 ]
+QUERY = """[out:json][timeout:120];
+area["name"="{city}"]["place"~"city|town"]->.a;
+(nwr["shop"~"furniture|kitchen"](area.a);
+ nwr["craft"~"carpenter|cabinet_maker|joiner|upholsterer"](area.a););
+out tags;"""
+PHONE_RE = re.compile(r"(?:\+7|8)[\s\-(]*\d{3}[\s\-)]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}")
+UA = {"User-Agent": "Mozilla/5.0"}
 
 
 def normalize_phone(raw):
@@ -33,103 +38,70 @@ def normalize_phone(raw):
     return None
 
 
-def search_2gis(city, query, key):
-    url = "https://catalog.api.2gis.com/3.0/items"
-    page, page_size = 1, 10
-    while True:
-        params = {
-            "q": f"{query} {city}",
-            "type": "branch",
-            "fields": "items.contact_groups,items.address,items.full_address_name",
-            "page": page,
-            "page_size": page_size,
-            "key": key,
-        }
-        data = requests.get(url, params=params, timeout=30).json()
-        code = data.get("meta", {}).get("code")
-        if code == 404:  # результаты закончились
-            return
-        if code != 200:
-            sys.exit(f"2ГИС ошибка: {data.get('meta', {}).get('error')}")
-        items = data["result"]["items"]
-        for it in items:
-            phones, site = [], None
-            for group in it.get("contact_groups", []):
-                for c in group.get("contacts", []):
-                    if c.get("type") == "phone":
-                        phones.append(c.get("value") or c.get("text"))
-                    elif c.get("type") == "website" and not site:
-                        site = c.get("text") or c.get("value")
-            yield {
-                "name": it.get("name"),
-                "phones": phones,
-                "address": it.get("full_address_name") or it.get("address_name"),
-                "site": site,
-            }
-        if page * page_size >= data["result"].get("total", 0) or not items:
-            return
-        page += 1
-        time.sleep(0.3)
+def fetch_osm(city):
+    for attempt in range(4):
+        for url in OVERPASS:
+            try:
+                r = requests.get(url, params={"data": QUERY.format(city=city)}, timeout=150)
+                if r.ok:
+                    return r.json()["elements"]
+            except (requests.RequestException, ValueError):
+                pass
+        time.sleep(10 * (attempt + 1))
+    sys.exit("OpenStreetMap не ответил, попробуйте позже")
 
 
-def search_google(city, query, key):
-    url = "https://places.googleapis.com/v1/places:searchText"
-    headers = {
-        "X-Goog-Api-Key": key,
-        "X-Goog-FieldMask": "places.displayName,places.nationalPhoneNumber,"
-                            "places.internationalPhoneNumber,places.formattedAddress,"
-                            "places.websiteUri,nextPageToken",
-    }
-    body = {"textQuery": f"{query} {city}", "languageCode": "ru",
-            "regionCode": "RU", "pageSize": 20}
-    while True:
-        data = requests.post(url, json=body, headers=headers, timeout=30).json()
-        if "error" in data:
-            sys.exit(f"Google ошибка: {data['error'].get('message')}")
-        for p in data.get("places", []):
-            yield {
-                "name": p.get("displayName", {}).get("text"),
-                "phones": [p.get("internationalPhoneNumber") or p.get("nationalPhoneNumber")],
-                "address": p.get("formattedAddress"),
-                "site": p.get("websiteUri"),
-            }
-        token = data.get("nextPageToken")
-        if not token:
-            return
-        body["pageToken"] = token
-        time.sleep(2)
+def phones_from_site(site):
+    if not site.startswith("http"):
+        site = "http://" + site
+    found = []
+    for path in ("", "/contacts", "/kontakty", "/contact"):
+        try:
+            html = requests.get(urljoin(site, path), headers=UA, timeout=10).text
+        except requests.RequestException:
+            continue
+        tel_links = re.findall(r'href="tel:([^"]+)"', html)
+        found += tel_links or PHONE_RE.findall(html)
+        if found:
+            break
+    return found
 
 
 def main():
     ap = argparse.ArgumentParser(description="Телефоны мебельщиков города -> Excel")
     ap.add_argument("city", help="Город, например Казань")
-    ap.add_argument("--source", choices=["2gis", "google"], default="2gis")
-    ap.add_argument("--key", required=True, help="API-ключ 2ГИС или Google")
+    ap.add_argument("--no-sites", action="store_true", help="Не заходить на сайты компаний")
     ap.add_argument("--out", help="Имя файла .xlsx")
     args = ap.parse_args()
 
-    search = search_2gis if args.source == "2gis" else search_google
+    elements = fetch_osm(args.city)
+    print(f"Найдено в OpenStreetMap: {len(elements)}")
     rows, seen = [], set()
-    for q in QUERIES:
-        found = 0
-        for org in search(args.city, q, args.key):
-            for raw in org["phones"]:
-                phone = normalize_phone(raw)
-                if phone and phone not in seen:
-                    seen.add(phone)
-                    rows.append([org["name"], phone, org["address"], org["site"], q])
-                    found += 1
-        print(f"{q}: +{found} новых номеров")
+    for e in elements:
+        t = e.get("tags", {})
+        site = t.get("website") or t.get("contact:website")
+        raw = ";".join(filter(None, [t.get("phone"), t.get("contact:phone"),
+                                     t.get("contact:mobile")]))
+        phones, source = re.split(r"[;,]", raw) if raw else [], "OSM"
+        if not phones and site and not args.no_sites:
+            phones, source = phones_from_site(site), "сайт"
+        for p in phones:
+            phone = normalize_phone(p)
+            if phone and phone not in seen:
+                seen.add(phone)
+                addr = ", ".join(filter(None, [t.get("addr:street"), t.get("addr:housenumber")]))
+                rows.append([t.get("name"), phone, addr, site,
+                             t.get("shop") or t.get("craft"), source])
 
     wb = Workbook()
     ws = wb.active
     ws.title = "Мебельщики"
-    ws.append(["Название", "Телефон", "Адрес", "Сайт", "Запрос"])
+    ws.append(["Название", "Телефон", "Адрес", "Сайт", "Тип", "Откуда телефон"])
     for r in rows:
         ws.append(r)
-    for col, width in zip("ABCDE", (40, 16, 50, 35, 28)):
+    for col, width in zip("ABCDEF", (40, 16, 35, 35, 15, 15)):
         ws.column_dimensions[col].width = width
-    out = args.out or f"mebel_{args.city.replace(' ', '_')}_{args.source}.xlsx"
+    out = args.out or f"mebel_{args.city.replace(' ', '_')}.xlsx"
     wb.save(out)
     print(f"Готово: {len(rows)} номеров -> {out}")
 
